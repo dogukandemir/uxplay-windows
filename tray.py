@@ -102,6 +102,13 @@ class ArgumentManager:
 
 # ─── mDNSResponder Manager ────────────────────────────────────────────────────
 
+# How long to wait after spawning mDNSResponder before deciding it launched OK.
+_MDNS_STARTUP_CHECK_SECS = 1
+
+# How long to wait after mDNSResponder starts before launching uxplay.exe so
+# mDNS is ready to accept DNS-SD registrations.
+_MDNS_READY_SECS = 2
+
 class MdnsManager:
     """
     Manages a bundled mDNSResponder.exe for portable use.
@@ -156,7 +163,7 @@ class MdnsManager:
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
             # Give the process a moment to start (or fail immediately)
-            time.sleep(1)
+            time.sleep(_MDNS_STARTUP_CHECK_SECS)
             if self.process.poll() is not None:
                 logging.warning(
                     "mDNSResponder exited immediately (code %s). "
@@ -432,7 +439,7 @@ class Application:
     def _delayed_start(self):
         # Start mDNSResponder first so it is ready before uxplay.exe connects
         self.mdns_mgr.start()
-        time.sleep(2)
+        time.sleep(_MDNS_READY_SECS)
         self.server_mgr.start()
 
 if __name__ == "__main__":

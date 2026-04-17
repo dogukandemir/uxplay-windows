@@ -122,6 +122,9 @@ jobs:
       - name: extract Bonjour mDNSResponder and dnssd.dll
         shell: powershell
         run: |
+          # Apple Bonjour for Windows 3.0 (build 061-8098, released 2010-06-03).
+          # This is the same URL used by the original Inno Setup installer script.
+          # If Apple ever moves this file, update the URL below.
           $bonjourUrl  = "https://download.info.apple.com/Mac_OS_X/061-8098.20100603.gthyu/BonjourPSSetup.exe"
           $setupExe    = "$env:TEMP\BonjourPSSetup.exe"
           $extractPath = "$env:TEMP\bonjour_extract"
@@ -143,22 +146,37 @@ jobs:
           Write-Host "Installing Bonjour silently (to extract files)…"
           Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /quiet /norestart" -Wait
 
-          # The installer copies mDNSResponder.exe and dnssd.dll to standard locations
-          $mdnsExe  = "C:\Program Files\Bonjour\mDNSResponder.exe"
-          $dnssdDll = "C:\Windows\System32\dnssd.dll"
-
-          if (-not (Test-Path $mdnsExe)) {
-            Write-Error "mDNSResponder.exe not found at expected path: $mdnsExe"
+          # Locate mDNSResponder.exe – typically in C:\Program Files\Bonjour\
+          # Search dynamically to handle non-default installation directories.
+          $mdnsExe = Get-ChildItem -Path "C:\Program Files\Bonjour" -Filter "mDNSResponder.exe" -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1 -ExpandProperty FullName
+          if (-not $mdnsExe) {
+            $mdnsExe = Get-ChildItem -Path "C:\Program Files (x86)\Bonjour" -Filter "mDNSResponder.exe" -Recurse -ErrorAction SilentlyContinue |
+                       Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $mdnsExe) {
+            Write-Error "mDNSResponder.exe not found after Bonjour installation."
             exit 1
           }
+
+          # Locate dnssd.dll – on 64-bit Windows installed to System32 (64-bit copy)
+          $dnssdDll = "C:\Windows\System32\dnssd.dll"
           if (-not (Test-Path $dnssdDll)) {
-            Write-Error "dnssd.dll not found at expected path: $dnssdDll"
+            $dnssdDll = Get-ChildItem -Path "C:\Windows" -Filter "dnssd.dll" -Recurse -ErrorAction SilentlyContinue |
+                        Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $dnssdDll) {
+            Write-Error "dnssd.dll not found after Bonjour installation."
             exit 1
           }
 
           Write-Host "Bonjour files ready:"
-          Write-Host "  mDNSResponder.exe: $(Get-Item $mdnsExe | Select-Object -ExpandProperty FullName)"
-          Write-Host "  dnssd.dll        : $(Get-Item $dnssdDll | Select-Object -ExpandProperty FullName)"
+          Write-Host "  mDNSResponder.exe: $mdnsExe"
+          Write-Host "  dnssd.dll        : $dnssdDll"
+
+          # Store paths for the next step
+          echo "MDNS_EXE=$mdnsExe"     >> $env:GITHUB_ENV
+          echo "DNSSD_DLL=$dnssdDll"   >> $env:GITHUB_ENV
 
       # compiling the python tray icon into an .exe
       - name: install pyinstaller and dependencies
@@ -178,8 +196,8 @@ jobs:
 
           # Bundle the Bonjour dnssd.dll and mDNSResponder.exe for portable use.
           # Users with no admin rights can run these without installing Bonjour.
-          cp "C:\Program Files\Bonjour\mDNSResponder.exe" D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
-          cp "C:\Windows\System32\dnssd.dll"              D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
+          cp "$env:MDNS_EXE"   D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
+          cp "$env:DNSSD_DLL"  D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
 
       - name: create portable ZIP
         shell: powershell
