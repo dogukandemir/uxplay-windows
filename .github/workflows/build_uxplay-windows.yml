@@ -23,16 +23,25 @@ jobs:
         uses: actions/checkout@v4
           
       - name: download+install mDNSResponder libraries
+        shell: pwsh
         run: |
           git clone -b rel/mDNSResponder-214 https://github.com/apple-oss-distributions/mDNSResponder.git --depth 1 mdns214
-          cp dnssd.vcxproj mdns214\mDNSWindows\DLL\dnssd.vcxproj
-          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe' mdns214\mDNSWindows\DLL\dnssd.vcxproj /p:Configuration=Release /p:Platform=x64
 
-          mkdir "C:\Program Files\Bonjour SDK\Include"
-          mkdir "C:\Program Files\Bonjour SDK\Lib\x64"
-          cp mdns214\mDNSShared\dns_sd.h "C:\Program Files\Bonjour SDK\Include\dns_sd.h"
-          cp mdns214\mDNSWindows\DLL\x64\Release\dnssd.lib "C:\Program Files\Bonjour SDK\Lib\x64\dnssd.lib"
-        # this compiling has errors, but we don't care because all we need is dnssd.lib which gets compiled with no issues
+          # Build dnssd.dll + dnssd.lib (client DLL used by UxPlay and bundled in the portable ZIP)
+          Copy-Item dnssd.vcxproj mdns214\mDNSWindows\DLL\dnssd.vcxproj
+          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe' `
+              mdns214\mDNSWindows\DLL\dnssd.vcxproj /p:Configuration=Release /p:Platform=x64
+
+          # Install Bonjour SDK headers + import lib so cmake can find them
+          New-Item -ItemType Directory -Force "C:\Program Files\Bonjour SDK\Include" | Out-Null
+          New-Item -ItemType Directory -Force "C:\Program Files\Bonjour SDK\Lib\x64" | Out-Null
+          Copy-Item mdns214\mDNSShared\dns_sd.h  "C:\Program Files\Bonjour SDK\Include\dns_sd.h"
+          Copy-Item mdns214\mDNSWindows\DLL\x64\Release\dnssd.lib "C:\Program Files\Bonjour SDK\Lib\x64\dnssd.lib"
+
+          # Build mDNSResponder.exe (the mDNS service daemon bundled for portable use)
+          Copy-Item mDNSResponder.vcxproj mdns214\mDNSWindows\SystemService\mDNSResponder.vcxproj
+          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe' `
+              mdns214\mDNSWindows\SystemService\mDNSResponder.vcxproj /p:Configuration=Release /p:Platform=x64
         continue-on-error: true
 
       - name: download+install msys2 and related build dependencies
@@ -116,67 +125,31 @@ jobs:
           Get-ChildItem -Path $artifactDir -Recurse | Select-Object FullName
         shell: powershell
 
-      # Download and extract Apple Bonjour for Windows to get mDNSResponder.exe
-      # and the matching dnssd.dll.  The CI runner has admin rights so we can
-      # run the installer silently; end-users never need to do this.
-      - name: extract Bonjour mDNSResponder and dnssd.dll
-        shell: powershell
+      # Use the dnssd.dll and mDNSResponder.exe built from source in the step above.
+      # No external downloads required - both binaries come from the mDNSResponder-214 clone.
+      - name: collect Bonjour mDNSResponder and dnssd.dll
+        shell: pwsh
         run: |
-          # Apple Bonjour for Windows 3.0 (build 061-8098, released 2010-06-03).
-          # This is the same URL used by the original Inno Setup installer script.
-          # If Apple ever moves this file, update the URL below.
-          $bonjourUrl  = "https://download.info.apple.com/Mac_OS_X/061-8098.20100603.gthyu/BonjourPSSetup.exe"
-          $setupExe    = "$env:TEMP\BonjourPSSetup.exe"
-          $extractPath = "$env:TEMP\bonjour_extract"
+          $dnssdDll = "mdns214\mDNSWindows\DLL\x64\Release\dnssd.dll"
+          $mdnsExe  = "mdns214\mDNSWindows\SystemService\x64\Release\mDNSResponder.exe"
 
-          Write-Host "Downloading Bonjour installer…"
-          Invoke-WebRequest $bonjourUrl -OutFile $setupExe
-
-          Write-Host "Extracting Bonjour MSI…"
-          New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
-          Start-Process -FilePath $setupExe -ArgumentList "/extract `"$extractPath`"" -Wait
-
-          $msiPath = "$extractPath\Bonjour64.msi"
-          if (-not (Test-Path $msiPath)) {
-            Write-Host "Bonjour64.msi not found after extract – listing directory:"
-            Get-ChildItem $extractPath | Select-Object Name
-            exit 1
-          }
-
-          Write-Host "Installing Bonjour silently (to extract files)…"
-          Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /quiet /norestart" -Wait
-
-          # Locate mDNSResponder.exe – typically in C:\Program Files\Bonjour\
-          # Search dynamically to handle non-default installation directories.
-          $mdnsExe = Get-ChildItem -Path "C:\Program Files\Bonjour" -Filter "mDNSResponder.exe" -Recurse -ErrorAction SilentlyContinue |
-                     Select-Object -First 1 -ExpandProperty FullName
-          if (-not $mdnsExe) {
-            $mdnsExe = Get-ChildItem -Path "C:\Program Files (x86)\Bonjour" -Filter "mDNSResponder.exe" -Recurse -ErrorAction SilentlyContinue |
-                       Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $mdnsExe) {
-            Write-Error "mDNSResponder.exe not found after Bonjour installation."
-            exit 1
-          }
-
-          # Locate dnssd.dll – on 64-bit Windows installed to System32 (64-bit copy)
-          $dnssdDll = "C:\Windows\System32\dnssd.dll"
           if (-not (Test-Path $dnssdDll)) {
-            $dnssdDll = Get-ChildItem -Path "C:\Windows" -Filter "dnssd.dll" -Recurse -ErrorAction SilentlyContinue |
-                        Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $dnssdDll) {
-            Write-Error "dnssd.dll not found after Bonjour installation."
+            Write-Error "Locally built dnssd.dll not found at '$dnssdDll'. Was the dnssd build step successful?"
             exit 1
           }
 
-          Write-Host "Bonjour files ready:"
-          Write-Host "  mDNSResponder.exe: $mdnsExe"
-          Write-Host "  dnssd.dll        : $dnssdDll"
+          $dnssdFull = (Resolve-Path $dnssdDll).Path
+          Write-Host "dnssd.dll : $dnssdFull"
+          "DNSSD_DLL=$dnssdFull" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Store paths for the next step
-          echo "MDNS_EXE=$mdnsExe"     >> $env:GITHUB_ENV
-          echo "DNSSD_DLL=$dnssdDll"   >> $env:GITHUB_ENV
+          if (Test-Path $mdnsExe) {
+            $mdnsFull = (Resolve-Path $mdnsExe).Path
+            Write-Host "mDNSResponder.exe : $mdnsFull"
+            "MDNS_EXE=$mdnsFull" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Warning "mDNSResponder.exe not found - mDNS service will not be bundled in the portable ZIP."
+            Write-Warning "Users will need Apple Bonjour installed for mDNS discovery."
+          }
 
       # compiling the python tray icon into an .exe
       - name: install pyinstaller and dependencies
@@ -194,10 +167,16 @@ jobs:
           # Copy the app icon into _internal so tray.py can find it at runtime
           cp D:\a\uxplay-windows\uxplay-windows\icon.ico D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal
 
-          # Bundle the Bonjour dnssd.dll and mDNSResponder.exe for portable use.
-          # Users with no admin rights can run these without installing Bonjour.
-          cp "$env:MDNS_EXE"   D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
+          # Bundle dnssd.dll for portable use (required - uxplay.exe links against it at runtime).
           cp "$env:DNSSD_DLL"  D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
+
+          # Bundle mDNSResponder.exe if it was built successfully (optional - graceful degradation
+          # if the mDNSResponder build failed; users with Bonjour installed will still get mDNS).
+          if ($env:MDNS_EXE -and (Test-Path $env:MDNS_EXE)) {
+            cp "$env:MDNS_EXE" D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
+          } else {
+            Write-Warning "Skipping mDNSResponder.exe bundle - file not found."
+          }
 
       - name: create portable ZIP
         shell: powershell
