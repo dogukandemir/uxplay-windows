@@ -42,7 +42,6 @@ jobs:
           Copy-Item mDNSResponder.vcxproj mdns214\mDNSWindows\SystemService\mDNSResponder.vcxproj
           & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe' `
               mdns214\mDNSWindows\SystemService\mDNSResponder.vcxproj /p:Configuration=Release /p:Platform=x64
-        continue-on-error: true
 
       - name: download+install msys2 and related build dependencies
         uses: msys2/setup-msys2@v2
