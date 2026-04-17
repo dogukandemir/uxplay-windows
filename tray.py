@@ -67,6 +67,9 @@ class Paths:
         ux2 = self.resource_dir / "uxplay.exe"
         self.uxplay_exe = ux1 if ux1.exists() else ux2
 
+        # bundled mDNSResponder for portable use (may not exist if Bonjour is system-installed)
+        self.mdns_exe = self.resource_dir / "bin" / "mDNSResponder.exe"
+
         # AppData paths
         self.appdata_dir = APPDATA_DIR
         self.arguments_file = self.appdata_dir / "arguments.txt"
@@ -97,6 +100,103 @@ class ArgumentManager:
             logging.error("Could not parse arguments.txt: %s", e)
             return []
 
+# ─── mDNSResponder Manager ────────────────────────────────────────────────────
+
+# How long to wait after spawning mDNSResponder before deciding it launched OK.
+_MDNS_STARTUP_CHECK_SECS = 1
+
+# How long to wait after mDNSResponder starts before launching uxplay.exe so
+# mDNS is ready to accept DNS-SD registrations.
+_MDNS_READY_SECS = 2
+
+class MdnsManager:
+    """
+    Manages a bundled mDNSResponder.exe for portable use.
+
+    If the Bonjour service is already running system-wide we skip launching
+    our own copy to avoid conflicts.  If the bundled executable is missing we
+    log a warning and carry on (the user may have Bonjour installed separately).
+    """
+
+    BONJOUR_SERVICE = "Bonjour Service"
+
+    def __init__(self, exe_path: Path):
+        self.exe_path = exe_path
+        self.process: Optional[subprocess.Popen] = None
+
+    # ------------------------------------------------------------------
+    def _bonjour_service_running(self) -> bool:
+        """Return True if the Windows Bonjour service is already running."""
+        try:
+            result = subprocess.run(
+                ["sc", "query", self.BONJOUR_SERVICE],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return "RUNNING" in result.stdout
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        if self._bonjour_service_running():
+            logging.info("Bonjour service already running – skipping bundled mDNSResponder")
+            return
+
+        if not self.exe_path.exists():
+            logging.warning(
+                "Bundled mDNSResponder not found at %s. "
+                "mDNS discovery may not work unless Bonjour is installed.",
+                self.exe_path,
+            )
+            return
+
+        if self.process and self.process.poll() is None:
+            logging.info("mDNSResponder already running (PID %s)", self.process.pid)
+            return
+
+        logging.info("Starting bundled mDNSResponder: %s", self.exe_path)
+        try:
+            self.process = subprocess.Popen(
+                [str(self.exe_path)],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            # Give the process a moment to start (or fail immediately)
+            time.sleep(_MDNS_STARTUP_CHECK_SECS)
+            if self.process.poll() is not None:
+                logging.warning(
+                    "mDNSResponder exited immediately (code %s). "
+                    "mDNS discovery may not work on this machine without "
+                    "the Bonjour service installed.",
+                    self.process.returncode,
+                )
+                self.process = None
+            else:
+                logging.info("Started mDNSResponder (PID %s)", self.process.pid)
+        except Exception:
+            logging.exception("Failed to launch mDNSResponder")
+
+    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        if not (self.process and self.process.poll() is None):
+            return
+        pid = self.process.pid
+        logging.info("Stopping mDNSResponder (PID %s)…", pid)
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=3)
+            logging.info("mDNSResponder stopped.")
+        except subprocess.TimeoutExpired:
+            logging.warning("mDNSResponder did not stop in time; killing it.")
+            self.process.kill()
+            self.process.wait()
+        except Exception:
+            logging.exception("Error stopping mDNSResponder")
+        finally:
+            self.process = None
+
+
 # ─── Server Process Manager ──────────────────────────────────────────────────
 
 class ServerManager:
@@ -104,6 +204,28 @@ class ServerManager:
         self.exe_path = exe_path
         self.arg_mgr = arg_mgr
         self.process: Optional[subprocess.Popen] = None
+
+    def _build_env(self) -> dict:
+        """Build an environment suitable for running uxplay.exe portably."""
+        env = os.environ.copy()
+
+        bin_dir = self.exe_path.parent
+        internal_dir = bin_dir.parent
+
+        # Ensure the bundled DLL directory is first in PATH so Windows finds
+        # the bundled copies before any system-wide DLLs.
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+
+        # GStreamer plugin path – mingw64 gstreamer looks for plugins relative
+        # to its DLL (../lib/gstreamer-1.0), but set the env var explicitly to
+        # be safe when the layout differs.
+        gst_plugin_path = internal_dir / "lib" / "gstreamer-1.0"
+        if gst_plugin_path.exists():
+            env["GST_PLUGIN_PATH"] = str(gst_plugin_path)
+            env["GST_PLUGIN_SYSTEM_PATH"] = str(gst_plugin_path)
+            logging.debug("GST_PLUGIN_PATH → %s", gst_plugin_path)
+
+        return env
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
@@ -119,7 +241,8 @@ class ServerManager:
         try:
             self.process = subprocess.Popen(
                 cmd,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                env=self._build_env(),
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             logging.info("Started UxPlay (PID %s)", self.process.pid)
         except Exception:
@@ -271,6 +394,7 @@ class TrayIcon:
         logging.info("Exiting tray")
         self.server_mgr.stop()
         self.icon.stop()
+        # MdnsManager.stop() is called from Application after the tray exits
 
     def run(self):
         self.icon.run()
@@ -281,6 +405,7 @@ class Application:
     def __init__(self):
         self.paths = Paths()
         self.arg_mgr = ArgumentManager(self.paths.arguments_file)
+        self.mdns_mgr = MdnsManager(self.paths.mdns_exe)
 
         # Build the exact command string for registry
         script = Path(__file__).resolve()
@@ -308,8 +433,13 @@ class Application:
         self.tray.run()
         logging.info("Tray exited – shutting down")
 
+        # Clean up mDNSResponder after the tray loop exits
+        self.mdns_mgr.stop()
+
     def _delayed_start(self):
-        time.sleep(3)
+        # Start mDNSResponder first so it is ready before uxplay.exe connects
+        self.mdns_mgr.start()
+        time.sleep(_MDNS_READY_SECS)
         self.server_mgr.start()
 
 if __name__ == "__main__":

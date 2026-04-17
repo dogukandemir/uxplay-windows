@@ -22,11 +22,6 @@ jobs:
       - name: clone the repo
         uses: actions/checkout@v4
           
-      - name: download & install Inno Setup
-        run: |
-          Invoke-WebRequest https://jrsoftware.org/download.php/is.exe -OutFile is.exe
-          start (Join-Path -Path $(Get-Location) -ChildPath "is.exe") /VERYSILENT
-        
       - name: download+install mDNSResponder libraries
         run: |
           git clone -b rel/mDNSResponder-214 https://github.com/apple-oss-distributions/mDNSResponder.git --depth 1 mdns214
@@ -121,27 +116,106 @@ jobs:
           Get-ChildItem -Path $artifactDir -Recurse | Select-Object FullName
         shell: powershell
 
+      # Download and extract Apple Bonjour for Windows to get mDNSResponder.exe
+      # and the matching dnssd.dll.  The CI runner has admin rights so we can
+      # run the installer silently; end-users never need to do this.
+      - name: extract Bonjour mDNSResponder and dnssd.dll
+        shell: powershell
+        run: |
+          # Apple Bonjour for Windows 3.0 (build 061-8098, released 2010-06-03).
+          # This is the same URL used by the original Inno Setup installer script.
+          # If Apple ever moves this file, update the URL below.
+          $bonjourUrl  = "https://download.info.apple.com/Mac_OS_X/061-8098.20100603.gthyu/BonjourPSSetup.exe"
+          $setupExe    = "$env:TEMP\BonjourPSSetup.exe"
+          $extractPath = "$env:TEMP\bonjour_extract"
+
+          Write-Host "Downloading Bonjour installer…"
+          Invoke-WebRequest $bonjourUrl -OutFile $setupExe
+
+          Write-Host "Extracting Bonjour MSI…"
+          New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+          Start-Process -FilePath $setupExe -ArgumentList "/extract `"$extractPath`"" -Wait
+
+          $msiPath = "$extractPath\Bonjour64.msi"
+          if (-not (Test-Path $msiPath)) {
+            Write-Host "Bonjour64.msi not found after extract – listing directory:"
+            Get-ChildItem $extractPath | Select-Object Name
+            exit 1
+          }
+
+          Write-Host "Installing Bonjour silently (to extract files)…"
+          Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /quiet /norestart" -Wait
+
+          # Locate mDNSResponder.exe – typically in C:\Program Files\Bonjour\
+          # Search dynamically to handle non-default installation directories.
+          $mdnsExe = Get-ChildItem -Path "C:\Program Files\Bonjour" -Filter "mDNSResponder.exe" -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1 -ExpandProperty FullName
+          if (-not $mdnsExe) {
+            $mdnsExe = Get-ChildItem -Path "C:\Program Files (x86)\Bonjour" -Filter "mDNSResponder.exe" -Recurse -ErrorAction SilentlyContinue |
+                       Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $mdnsExe) {
+            Write-Error "mDNSResponder.exe not found after Bonjour installation."
+            exit 1
+          }
+
+          # Locate dnssd.dll – on 64-bit Windows installed to System32 (64-bit copy)
+          $dnssdDll = "C:\Windows\System32\dnssd.dll"
+          if (-not (Test-Path $dnssdDll)) {
+            $dnssdDll = Get-ChildItem -Path "C:\Windows" -Filter "dnssd.dll" -Recurse -ErrorAction SilentlyContinue |
+                        Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $dnssdDll) {
+            Write-Error "dnssd.dll not found after Bonjour installation."
+            exit 1
+          }
+
+          Write-Host "Bonjour files ready:"
+          Write-Host "  mDNSResponder.exe: $mdnsExe"
+          Write-Host "  dnssd.dll        : $dnssdDll"
+
+          # Store paths for the next step
+          echo "MDNS_EXE=$mdnsExe"     >> $env:GITHUB_ENV
+          echo "DNSSD_DLL=$dnssdDll"   >> $env:GITHUB_ENV
+
       # compiling the python tray icon into an .exe
       - name: install pyinstaller and dependencies
         run: |
           python -m venv ./venv
           .\venv\Scripts\Activate.ps1
           python -m pip install --upgrade pip
-          pip install pyinstaller pystray
+          pip install pyinstaller pystray pillow
 
           pyinstaller --noconsole --onedir --clean --name uxplay-windows --icon=icon.ico tray.py
 
+          # Copy UxPlay binaries and GStreamer libraries
           cp -r D:\a\uxplay-windows\uxplay-windows\UxPlay\build\artifact\* D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal
+
+          # Copy the app icon into _internal so tray.py can find it at runtime
           cp D:\a\uxplay-windows\uxplay-windows\icon.ico D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal
-          
-      - name: compile the installer with inno setup
-        run: .$(Join-Path -Path ${env:PROGRAMFILES(X86)} -ChildPath 'Inno Setup 6\\ISCC.exe') $(Join-Path -Path $(Get-Location) -ChildPath "script.iss")
-        
-      - name: uploading artifact
+
+          # Bundle the Bonjour dnssd.dll and mDNSResponder.exe for portable use.
+          # Users with no admin rights can run these without installing Bonjour.
+          cp "$env:MDNS_EXE"   D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
+          cp "$env:DNSSD_DLL"  D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal\bin\
+
+      - name: create portable ZIP
+        shell: powershell
+        run: |
+          $distDir  = "D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows"
+          $zipPath  = "D:\a\uxplay-windows\uxplay-windows\uxplay-windows-portable.zip"
+
+          Write-Host "Packaging portable ZIP from: $distDir"
+          Compress-Archive -Path "$distDir\*" -DestinationPath $zipPath -CompressionLevel Optimal
+
+          $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
+          Write-Host "Created portable ZIP ($sizeMB MB): $zipPath"
+
+      - name: upload portable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: uxplay-windows
-          path: Output\uxplay-windows.exe
+          name: uxplay-windows-portable
+          path: uxplay-windows-portable.zip
 
       # move this between steps for debugging
       - name: (optional) Setup tmate session
